@@ -1,0 +1,6 @@
+{
+  "name": "VozLivre - Conversor de Texto em Áudio Natural e Ilimitado",
+  "description": "Converte textos longos de até 20.000 caracteres em áudio com vozes neurais ultra-realistas e download gratuito em MP3 e WAV, sem limites ou créditos.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

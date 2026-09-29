@@ -1,0 +1,11 @@
+{
+  "framework": "vite",
+  "buildCommand": "vite build",
+  "outputDirectory": "dist",
+  "rewrites": [
+    { "source": "/api/(.*)", "destination": "/api/$1" },
+    { "source": "/Vozgerador/assets/(.*)", "destination": "/assets/$1" },
+    { "source": "/Vozgerador/(.*)", "destination": "/$1" },
+    { "source": "/((?!api/).*)", "destination": "/index.html" }
+  ]
+}
