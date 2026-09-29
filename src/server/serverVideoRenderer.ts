@@ -21,6 +21,23 @@ for (const dir of [TEMP_BASE_DIR, VIDEOS_DIR]) {
   }
 }
 
+// Prune any stale render temp directories left from prior server restarts or crashes (>1 hour old)
+try {
+  if (fs.existsSync(TEMP_BASE_DIR)) {
+    const entries = fs.readdirSync(TEMP_BASE_DIR);
+    const now = Date.now();
+    for (const entry of entries) {
+      const fullPath = path.join(TEMP_BASE_DIR, entry);
+      try {
+        const stat = fs.statSync(fullPath);
+        if (stat.isDirectory() && now - stat.mtimeMs > 3600000) {
+          fs.rmSync(fullPath, { recursive: true, force: true });
+        }
+      } catch {}
+    }
+  }
+} catch {}
+
 // FreeSansBold font path verified on Ubuntu container
 const DEFAULT_FONT_PATH = '/usr/share/fonts/truetype/freefont/FreeSansBold.ttf';
 const HAS_FONT = fs.existsSync(DEFAULT_FONT_PATH);
@@ -128,37 +145,35 @@ function chunkTextForSynthesis(raw: string, maxLen = 300): string[] {
 }
 
 /**
- * Synthesizes a chunk with MsEdgeTTS with XML sanitization and timeout safety
+ * Synthesizes a chunk with an active MsEdgeTTS instance with XML sanitization, stream drain and timeout safety
  */
-async function synthesizeChunkBuffer(text: string, voiceId: string): Promise<Buffer> {
-  const safeVoice = voiceId || 'pt-BR-FranciscaNeural';
+async function synthesizeChunkWithInstance(tts: MsEdgeTTS, text: string): Promise<Buffer> {
   const sanitizedText = escapeXmlForSSML(text);
-  const tts = new MsEdgeTTS();
-  await tts.setMetadata(safeVoice, OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3);
 
   return new Promise<Buffer>((resolve, reject) => {
     let finished = false;
     const timer = setTimeout(() => {
       if (!finished) {
         finished = true;
-        try {
-          tts.close();
-        } catch {}
-        reject(new Error('Timeout na síntese de voz neural (30s)'));
+        reject(new Error('Timeout no chunk de voz neural (30s)'));
       }
     }, 30000);
 
     try {
-      const { audioStream } = tts.toStream(sanitizedText);
+      const { audioStream, metadataStream } = tts.toStream(sanitizedText);
+
+      // Drain metadata stream safely to avoid unhandled errors and memory accumulation
+      if (metadataStream) {
+        metadataStream.resume();
+        metadataStream.on('error', () => {});
+      }
+
       const parts: Buffer[] = [];
       audioStream.on('data', (c: Buffer) => parts.push(c));
       audioStream.on('end', () => {
         if (!finished) {
           finished = true;
           clearTimeout(timer);
-          try {
-            tts.close();
-          } catch {}
           resolve(Buffer.concat(parts));
         }
       });
@@ -166,9 +181,6 @@ async function synthesizeChunkBuffer(text: string, voiceId: string): Promise<Buf
         if (!finished) {
           finished = true;
           clearTimeout(timer);
-          try {
-            tts.close();
-          } catch {}
           reject(err);
         }
       });
@@ -176,55 +188,106 @@ async function synthesizeChunkBuffer(text: string, voiceId: string): Promise<Buf
         if (!finished && parts.length > 0) {
           finished = true;
           clearTimeout(timer);
-          try {
-            tts.close();
-          } catch {}
           resolve(Buffer.concat(parts));
         }
       });
     } catch (err) {
       clearTimeout(timer);
-      try {
-        tts.close();
-      } catch {}
       reject(err);
     }
   });
 }
 
 /**
- * Synthesizes complete speech narration and saves to an MP3 file
+ * Synthesizes complete speech narration and streams directly to an MP3 file on disk.
+ * Optimized for long videos:
+ * - Reuses WebSocket connection across chunks (eliminates 20+ redundant TLS handshakes)
+ * - Streams directly to disk via appendFileSync (O(1) memory instead of holding entire audio buffer in RAM)
+ * - Auto-reconnects and falls back if connection drops
+ * - Non-blocking event loop with setImmediate yielding
  */
 async function synthesizeFullAudioToFile(text: string, voiceId: string, destFilePath: string): Promise<number> {
   const chunks = chunkTextForSynthesis(text);
-  const audioBuffers: Buffer[] = [];
-
-  for (const c of chunks) {
-    if (!c.trim()) continue;
+  if (fs.existsSync(destFilePath)) {
     try {
-      const buf = await synthesizeChunkBuffer(c, voiceId);
-      if (buf && buf.length > 0) {
-        audioBuffers.push(buf);
-      }
-    } catch (e: any) {
-      console.warn('Falha em chunk TTS, tentando fallback com Francisca:', e?.message);
+      fs.unlinkSync(destFilePath);
+    } catch {}
+  }
+
+  const primaryVoice = voiceId || 'pt-BR-FranciscaNeural';
+  const fallbackVoice = 'pt-BR-FranciscaNeural';
+
+  let currentTTS: MsEdgeTTS | null = null;
+  let currentVoiceUsed = '';
+
+  const getOrCreateTTS = async (voice: string): Promise<MsEdgeTTS> => {
+    if (currentTTS && currentVoiceUsed === voice) {
+      return currentTTS;
+    }
+    if (currentTTS) {
       try {
-        const fallbackBuf = await synthesizeChunkBuffer(c, 'pt-BR-FranciscaNeural');
-        if (fallbackBuf && fallbackBuf.length > 0) {
-          audioBuffers.push(fallbackBuf);
+        currentTTS.close();
+      } catch {}
+      currentTTS = null;
+    }
+    const t = new MsEdgeTTS();
+    await t.setMetadata(voice, OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3);
+    currentTTS = t;
+    currentVoiceUsed = voice;
+    return t;
+  };
+
+  let totalChunksWritten = 0;
+
+  try {
+    for (let idx = 0; idx < chunks.length; idx++) {
+      const c = chunks[idx];
+      if (!c.trim()) continue;
+
+      let chunkBuffer: Buffer | null = null;
+
+      try {
+        const tts = await getOrCreateTTS(primaryVoice);
+        chunkBuffer = await synthesizeChunkWithInstance(tts, c);
+      } catch (e: any) {
+        console.warn(`[Renderer] [TTS] Falha no chunk ${idx + 1}/${chunks.length} com voz primária (${e?.message}). Tentando reconexão/fallback...`);
+        if (currentTTS) {
+          try {
+            currentTTS.close();
+          } catch {}
+          currentTTS = null;
         }
-      } catch (fallbackErr: any) {
-        console.warn('Fallback com Francisca também falhou para o chunk:', fallbackErr?.message);
+
+        try {
+          const targetVoice = primaryVoice !== fallbackVoice ? fallbackVoice : primaryVoice;
+          const ttsFallback = await getOrCreateTTS(targetVoice);
+          chunkBuffer = await synthesizeChunkWithInstance(ttsFallback, c);
+        } catch (fallbackErr: any) {
+          console.warn(`[Renderer] [TTS] Erro repetido no chunk ${idx + 1}/${chunks.length}:`, fallbackErr?.message);
+        }
       }
+
+      if (chunkBuffer && chunkBuffer.length > 0) {
+        fs.appendFileSync(destFilePath, chunkBuffer);
+        totalChunksWritten++;
+        chunkBuffer = null; // Free chunk memory immediately
+      }
+
+      // Yield event loop between chunks so network keepalives and server routes remain responsive
+      await new Promise((r) => setImmediate(r));
+    }
+  } finally {
+    if (currentTTS) {
+      try {
+        currentTTS.close();
+      } catch {}
+      currentTTS = null;
     }
   }
 
-  if (audioBuffers.length === 0) {
-    throw new Error('Falha ao sintetizar o áudio da narração.');
+  if (totalChunksWritten === 0 || !fs.existsSync(destFilePath) || fs.statSync(destFilePath).size === 0) {
+    throw new Error('Falha ao sintetizar o áudio da narração (nenhum chunk de áudio gerado com sucesso).');
   }
-
-  const combinedAudio = Buffer.concat(audioBuffers);
-  fs.writeFileSync(destFilePath, combinedAudio);
 
   // Measure audio duration using async ffprobe
   const measuredDur = await runFfprobeDurationAsync(destFilePath);
@@ -348,48 +411,60 @@ export async function renderVideoForJob(
       }
 
       notify(26, 'IA gerando roteiro telejornalístico e cortes de cena...');
-      const scriptData = await geminiKeyManager.executeWithRotation(
-        async (aiClient) => generateReportageScript(aiClient, articleData, job.parsed.durationSeconds),
-        { taskName: 'Reportage Script Generation' }
-      );
-      title = scriptData.headline || articleData.title || 'Reportagem Especial';
-      fullNarration = scriptData.fullNarration || articleData.description || job.parsed.content;
+      try {
+        const scriptData = await geminiKeyManager.executeWithRotation(
+          async (aiClient) => generateReportageScript(aiClient, articleData, job.parsed.durationSeconds),
+          { taskName: 'Reportage Script Generation' }
+        );
+        title = scriptData.headline || articleData.title || 'Reportagem Especial';
+        fullNarration = scriptData.fullNarration || articleData.description || job.parsed.content;
 
-      if (Array.isArray(scriptData.scenes) && scriptData.scenes.length > 0) {
-        scenes = scriptData.scenes.map((sc: any) => ({
-          caption: sc.caption || sc.leadSummary || '',
-          narrationSegment: sc.leadSummary || sc.caption || '',
-          mediaUrl: sc.exactMediaUrl || sc.mediaUrl,
-          searchTag: sc.searchTag,
-          mediaType: sc.mediaType === 'video' ? 'video' : 'image',
-        }));
+        if (Array.isArray(scriptData.scenes) && scriptData.scenes.length > 0) {
+          scenes = scriptData.scenes.map((sc: any) => ({
+            caption: sc.caption || sc.leadSummary || '',
+            narrationSegment: sc.leadSummary || sc.caption || '',
+            mediaUrl: sc.exactMediaUrl || sc.mediaUrl,
+            searchTag: sc.searchTag,
+            mediaType: sc.mediaType === 'video' ? 'video' : 'image',
+          }));
+        }
+      } catch (reportageErr: any) {
+        console.warn('[Renderer] Fallback local para matéria jornalística:', reportageErr?.message);
+        title = articleData.title || 'Reportagem Especial';
+        fullNarration = articleData.description || articleData.text || job.parsed.content;
       }
     } else {
       // Roteiro Criativo / História
       notify(20, 'IA estruturando roteiro cinematográfico e narrativa...');
-      const narrativeResult = await geminiKeyManager.executeWithRotation(
-        async (aiClient) =>
-          generateNarrativeVideoScript(aiClient, {
-            mode: job.parsed.inputMode === 'full_prompt' ? 'full_prompt' : 'idea_theme',
-            storyText: job.parsed.content,
-            premise: job.parsed.content,
-            targetDurationSeconds: job.parsed.durationSeconds || 60,
-            aspectRatio: job.parsed.aspectRatio === '16:9' ? '16:9' : '9:16',
-          }),
-        { taskName: 'Narrative Script Generation' }
-      );
+      try {
+        const narrativeResult = await geminiKeyManager.executeWithRotation(
+          async (aiClient) =>
+            generateNarrativeVideoScript(aiClient, {
+              mode: job.parsed.inputMode === 'full_prompt' ? 'full_prompt' : 'idea_theme',
+              storyText: job.parsed.content,
+              premise: job.parsed.content,
+              targetDurationSeconds: job.parsed.durationSeconds || 60,
+              aspectRatio: job.parsed.aspectRatio === '16:9' ? '16:9' : '9:16',
+            }),
+          { taskName: 'Narrative Script Generation' }
+        );
 
-      title = narrativeResult.title || 'História Narrada';
-      fullNarration = narrativeResult.fullNarration;
+        title = narrativeResult.title || 'História Narrada';
+        fullNarration = narrativeResult.fullNarration;
 
-      if (Array.isArray(narrativeResult.scenes) && narrativeResult.scenes.length > 0) {
-        scenes = narrativeResult.scenes.map((sc) => ({
-          caption: sc.caption || sc.narrationSegment || '',
-          narrationSegment: sc.narrationSegment || sc.caption || '',
-          mediaUrl: sc.exactMediaUrl || sc.mediaUrl,
-          searchTag: sc.searchTag || sc.caption,
-          mediaType: sc.mediaType === 'video' ? 'video' : 'image',
-        }));
+        if (Array.isArray(narrativeResult.scenes) && narrativeResult.scenes.length > 0) {
+          scenes = narrativeResult.scenes.map((sc) => ({
+            caption: sc.caption || sc.narrationSegment || '',
+            narrationSegment: sc.narrationSegment || sc.caption || '',
+            mediaUrl: sc.exactMediaUrl || sc.mediaUrl,
+            searchTag: sc.searchTag || sc.caption,
+            mediaType: sc.mediaType === 'video' ? 'video' : 'image',
+          }));
+        }
+      } catch (narrativeErr: any) {
+        console.warn('[Renderer] Fallback local para divisão de roteiro criativo:', narrativeErr?.message);
+        title = 'História Narrada';
+        fullNarration = job.parsed.content;
       }
     }
 
@@ -515,6 +590,7 @@ export async function renderVideoForJob(
       if (isVideoClip) {
         const rawVid = path.join(jobDir, `scene_${idx}_video.mp4`);
         const vidFilter = `scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2:black,setsar=1${subtitleFilter}`;
+        const clipTimeoutMs = Math.max(90000, Math.ceil(sceneDuration * 5000));
         await runFfmpegAsync([
           '-y',
           '-i',
@@ -535,10 +611,11 @@ export async function renderVideoForJob(
           '25',
           '-an',
           sceneClipPath,
-        ]);
+        ], clipTimeoutMs);
       } else {
         // Image scene clip with scale & pad, using veryfast + stillimage for 5x speedup and bounded RAM
         const imgFilter = `scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2:black,setsar=1${subtitleFilter}`;
+        const clipTimeoutMs = Math.max(90000, Math.ceil(sceneDuration * 5000));
         await runFfmpegAsync([
           '-y',
           '-loop',
@@ -562,31 +639,37 @@ export async function renderVideoForJob(
           '-r',
           '25',
           sceneClipPath,
-        ]);
+        ], clipTimeoutMs);
       }
 
       sceneClipPaths.push(sceneClipPath);
+
+      // Progressive cleanup: delete raw media file immediately to reclaim disk & buffer cache
+      try {
+        if (fs.existsSync(sceneImgPath)) fs.unlinkSync(sceneImgPath);
+        const rawVid = path.join(jobDir, `scene_${idx}_video.mp4`);
+        if (fs.existsSync(rawVid)) fs.unlinkSync(rawVid);
+      } catch {}
+
+      // Yield event loop between scenes so node process handles timers & keepalives cleanly
+      await new Promise((r) => setImmediate(r));
+
       console.log(`[Renderer] [Job ${jobId}] [Perf] Cena ${idx + 1}/${scenes.length} renderizada em ${Date.now() - sceneStartTime}ms`);
     }
 
-    // 4. Concatenate all scene clips
-    const concatStartTime = Date.now();
-    notify(80, 'Renderizando e unificando trilha de vídeo MP4...');
+    // 4. Single-Pass Unification: Concat Clips + Audio Mux (speech + optional bg bed) directly to final MP4
+    // Eliminates redundant intermediate all_scenes.mp4, cutting disk I/O and render time in half for long videos
+    const muxStartTime = Date.now();
+    notify(82, 'Masterizando áudio e unificando cenas em etapa única...');
     const concatListPath = path.join(jobDir, 'concat_list.txt');
     const concatContent = sceneClipPaths.map((p) => `file '${p}'`).join('\n');
     fs.writeFileSync(concatListPath, concatContent);
 
-    const videoOnlyPath = path.join(jobDir, 'all_scenes.mp4');
-    await runFfmpegAsync(['-y', '-f', 'concat', '-safe', '0', '-i', concatListPath, '-c', 'copy', videoOnlyPath]);
-    console.log(`[Renderer] [Job ${jobId}] [Perf] Concatenação de cenas concluída em ${Date.now() - concatStartTime}ms`);
-
-    // 5. Final Mux: Video + Speech Audio (+ Background Music if enabled)
-    const muxStartTime = Date.now();
-    notify(88, 'Mixando locução neural e masterizando áudio...');
     const finalOutputPath = path.join(VIDEOS_DIR, `${jobId}.mp4`);
+    const muxTimeoutMs = Math.max(180000, Math.ceil(totalDurationSec * 3000));
 
     if (job.parsed.enableBgMusic) {
-      // Generate subtle atmospheric background bed (lavfi harmonic audio) and mix with speech
+      // Generate subtle atmospheric background bed (lavfi harmonic audio) and mix with speech in ONE pass
       const bgAudioPath = path.join(jobDir, 'bg_bed.mp3');
       try {
         await runFfmpegAsync([
@@ -594,17 +677,23 @@ export async function renderVideoForJob(
           '-f',
           'lavfi',
           '-i',
-          `sine=frequency=130:duration=${Math.ceil(totalDurationSec + 2)}`,
+          `sine=frequency=130:duration=${Math.ceil(totalDurationSec + 3)}`,
           '-af',
           'volume=0.06,lowpass=f=400',
           '-c:a',
           'mp3',
           bgAudioPath,
-        ]);
+        ], 60000);
+
+        // Single-pass Concat + Dual Audio Mix (speech + bg music) directly to finalOutputPath
         await runFfmpegAsync([
           '-y',
+          '-f',
+          'concat',
+          '-safe',
+          '0',
           '-i',
-          videoOnlyPath,
+          concatListPath,
           '-i',
           tempAudioPath,
           '-i',
@@ -623,13 +712,17 @@ export async function renderVideoForJob(
           '192k',
           '-shortest',
           finalOutputPath,
-        ]);
+        ], muxTimeoutMs);
       } catch (muxBgErr) {
         console.warn('[Renderer] Fallback para mixagem direta sem trilha de fundo:', muxBgErr);
         await runFfmpegAsync([
           '-y',
+          '-f',
+          'concat',
+          '-safe',
+          '0',
           '-i',
-          videoOnlyPath,
+          concatListPath,
           '-i',
           tempAudioPath,
           '-c:v',
@@ -640,13 +733,18 @@ export async function renderVideoForJob(
           '192k',
           '-shortest',
           finalOutputPath,
-        ]);
+        ], muxTimeoutMs);
       }
     } else {
+      // Single-pass Concat + Speech Audio Mux directly to finalOutputPath
       await runFfmpegAsync([
         '-y',
+        '-f',
+        'concat',
+        '-safe',
+        '0',
         '-i',
-        videoOnlyPath,
+        concatListPath,
         '-i',
         tempAudioPath,
         '-c:v',
@@ -657,9 +755,9 @@ export async function renderVideoForJob(
         '192k',
         '-shortest',
         finalOutputPath,
-      ]);
+      ], muxTimeoutMs);
     }
-    console.log(`[Renderer] [Job ${jobId}] [Perf] Mixagem final de áudio concluída em ${Date.now() - muxStartTime}ms`);
+    console.log(`[Renderer] [Job ${jobId}] [Perf] Concatenação e mixagem final em etapa única concluída em ${Date.now() - muxStartTime}ms`);
 
     if (!fs.existsSync(finalOutputPath)) {
       throw new Error('Falha ao compor o arquivo MP4 final.');
@@ -669,11 +767,6 @@ export async function renderVideoForJob(
     const videoSizeBytes = stat.size;
     const safeTitle = title.slice(0, 45).replace(/[^a-zA-Z0-9_\-\s]/g, '');
     const filename = `${safeTitle.replace(/\s+/g, '_')}.mp4`;
-
-    // Clean up temporary files in jobDir
-    try {
-      fs.rmSync(jobDir, { recursive: true, force: true });
-    } catch {}
 
     const totalElapsedSec = ((Date.now() - jobStartTime) / 1000).toFixed(2);
     const sizeMb = (videoSizeBytes / (1024 * 1024)).toFixed(2);
@@ -689,11 +782,14 @@ export async function renderVideoForJob(
       title,
       filename,
     };
-  } catch (err: any) {
-    // Clean up temp dir on error to prevent disk accumulation
+  } finally {
+    // Guaranteed cleanup of temporary files in jobDir even if cancelled or on error
     try {
-      if (fs.existsSync(jobDir)) fs.rmSync(jobDir, { recursive: true, force: true });
-    } catch {}
-    throw err;
+      if (fs.existsSync(jobDir)) {
+        fs.rmSync(jobDir, { recursive: true, force: true });
+      }
+    } catch (cleanErr) {
+      console.warn(`[Renderer] [Job ${jobId}] Aviso na limpeza de diretório temporário:`, cleanErr);
+    }
   }
 }
