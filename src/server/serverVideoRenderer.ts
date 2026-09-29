@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
-import { execSync } from 'child_process';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import { GoogleGenAI } from '@google/genai';
 import { MsEdgeTTS, OUTPUT_FORMAT } from 'msedge-tts';
 import { extractArticleFromUrl, generateReportageScript } from './reportageService';
@@ -8,6 +9,8 @@ import { generateNarrativeVideoScript, searchRealWebMedia } from './narrativeSer
 import { WhatsAppVideoJob, VOICE_CATALOG } from './whatsappService';
 import { ExtractedArticle } from '../types';
 import { geminiKeyManager } from './geminiKeyManager';
+
+const execFileAsync = promisify(execFile);
 
 const TEMP_BASE_DIR = path.resolve(process.cwd(), 'data', 'whatsapp', 'temp_render');
 const VIDEOS_DIR = path.resolve(process.cwd(), 'data', 'whatsapp', 'videos');
@@ -23,13 +26,75 @@ const DEFAULT_FONT_PATH = '/usr/share/fonts/truetype/freefont/FreeSansBold.ttf';
 const HAS_FONT = fs.existsSync(DEFAULT_FONT_PATH);
 
 /**
- * Escapes text for FFmpeg drawtext filter
+ * Executes FFmpeg asynchronously using execFile (zero shell injection, non-blocking event loop)
+ */
+async function runFfmpegAsync(args: string[], timeoutMs = 120000): Promise<{ stdout: string; stderr: string }> {
+  try {
+    return await execFileAsync('ffmpeg', args, {
+      timeout: timeoutMs,
+      maxBuffer: 8 * 1024 * 1024,
+    });
+  } catch (err: any) {
+    if (err?.killed) {
+      throw new Error(`FFmpeg abortado por timeout após ${timeoutMs / 1000}s`);
+    }
+    const errMsg = err?.stderr || err?.message || String(err);
+    throw new Error(`Erro na execução do FFmpeg: ${errMsg.slice(-400)}`);
+  }
+}
+
+/**
+ * Measures media duration with ffprobe asynchronously
+ */
+async function runFfprobeDurationAsync(filePath: string): Promise<number> {
+  try {
+    const { stdout } = await execFileAsync(
+      'ffprobe',
+      ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', filePath],
+      { timeout: 15000, maxBuffer: 1024 * 1024 }
+    );
+    const parsed = parseFloat(stdout.trim());
+    if (!isNaN(parsed) && parsed > 0) {
+      return parsed;
+    }
+  } catch (e) {
+    console.warn('[Renderer] Aviso ao verificar duração com ffprobe:', e);
+  }
+  return 0;
+}
+
+/**
+ * Sanitizes plain text for Microsoft Edge TTS SSML markup.
+ * Crucial fix: Prevents XML parsing crashes and WebSocket drops when encountering &, <, >, ", '
+ */
+function escapeXmlForSSML(text: string): string {
+  if (!text) return '';
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+/**
+ * Sanitizes text specifically for FFmpeg drawtext filter
+ * Cleans newlines, control characters, single/double quotes, and escapes FFmpeg filter syntax
  */
 function escapeDrawText(text: string): string {
   if (!text) return '';
-  return text
+  // 1. Remove newlines and excess whitespace
+  let clean = text.replace(/[\r\n\t]+/g, ' ').trim();
+  // 2. Remove emojis and unusual symbols that have no font glyphs and cause stderr spam
+  clean = clean.replace(
+    /[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F700}-\u{1F77F}\u{1F780}-\u{1F7FF}\u{1F800}-\u{1F8FF}\u{1F900}-\u{1F9FF}\u{1FA00}-\u{1FA6F}\u{1FA70}-\u{1FAFF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]/gu,
+    ''
+  );
+  // 3. Escape special FFmpeg drawtext characters
+  return clean
     .replace(/\\/g, '\\\\')
-    .replace(/'/g, '\u2019') // Replace single quote with typographic apostrophe to avoid shell breaks
+    .replace(/'/g, '\u2019') // Typographic apostrophe prevents shell/filter breaks
+    .replace(/"/g, '”') // Typographic double quote prevents breaking
     .replace(/:/g, '\\:')
     .replace(/%/g, '\\%')
     .replace(/\[/g, '\\[')
@@ -63,10 +128,11 @@ function chunkTextForSynthesis(raw: string, maxLen = 300): string[] {
 }
 
 /**
- * Synthesizes a chunk with MsEdgeTTS with timeout safety
+ * Synthesizes a chunk with MsEdgeTTS with XML sanitization and timeout safety
  */
 async function synthesizeChunkBuffer(text: string, voiceId: string): Promise<Buffer> {
   const safeVoice = voiceId || 'pt-BR-FranciscaNeural';
+  const sanitizedText = escapeXmlForSSML(text);
   const tts = new MsEdgeTTS();
   await tts.setMetadata(safeVoice, OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3);
 
@@ -75,20 +141,24 @@ async function synthesizeChunkBuffer(text: string, voiceId: string): Promise<Buf
     const timer = setTimeout(() => {
       if (!finished) {
         finished = true;
-        try { tts.close(); } catch {}
+        try {
+          tts.close();
+        } catch {}
         reject(new Error('Timeout na síntese de voz neural (30s)'));
       }
     }, 30000);
 
     try {
-      const { audioStream } = tts.toStream(text);
+      const { audioStream } = tts.toStream(sanitizedText);
       const parts: Buffer[] = [];
       audioStream.on('data', (c: Buffer) => parts.push(c));
       audioStream.on('end', () => {
         if (!finished) {
           finished = true;
           clearTimeout(timer);
-          try { tts.close(); } catch {}
+          try {
+            tts.close();
+          } catch {}
           resolve(Buffer.concat(parts));
         }
       });
@@ -96,12 +166,27 @@ async function synthesizeChunkBuffer(text: string, voiceId: string): Promise<Buf
         if (!finished) {
           finished = true;
           clearTimeout(timer);
-          try { tts.close(); } catch {}
+          try {
+            tts.close();
+          } catch {}
           reject(err);
+        }
+      });
+      audioStream.on('close', () => {
+        if (!finished && parts.length > 0) {
+          finished = true;
+          clearTimeout(timer);
+          try {
+            tts.close();
+          } catch {}
+          resolve(Buffer.concat(parts));
         }
       });
     } catch (err) {
       clearTimeout(timer);
+      try {
+        tts.close();
+      } catch {}
       reject(err);
     }
   });
@@ -128,7 +213,9 @@ async function synthesizeFullAudioToFile(text: string, voiceId: string, destFile
         if (fallbackBuf && fallbackBuf.length > 0) {
           audioBuffers.push(fallbackBuf);
         }
-      } catch {}
+      } catch (fallbackErr: any) {
+        console.warn('Fallback com Francisca também falhou para o chunk:', fallbackErr?.message);
+      }
     }
   }
 
@@ -139,20 +226,10 @@ async function synthesizeFullAudioToFile(text: string, voiceId: string, destFile
   const combinedAudio = Buffer.concat(audioBuffers);
   fs.writeFileSync(destFilePath, combinedAudio);
 
-  // Measure audio duration using ffprobe
-  try {
-    const rawDur = execSync(
-      `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${destFilePath}"`,
-      { stdio: 'pipe' }
-    )
-      .toString()
-      .trim();
-    const parsedDur = parseFloat(rawDur);
-    if (!isNaN(parsedDur) && parsedDur > 0) {
-      return parsedDur;
-    }
-  } catch (probeErr) {
-    console.warn('ffprobe error measuring audio duration, using estimation:', probeErr);
+  // Measure audio duration using async ffprobe
+  const measuredDur = await runFfprobeDurationAsync(destFilePath);
+  if (measuredDur > 0) {
+    return measuredDur;
   }
 
   // Fallback duration estimation: ~14 characters per second of speech
@@ -192,16 +269,23 @@ async function downloadMediaToLocalFile(url: string, destPath: string): Promise<
 /**
  * Generates a clean fallback card for a scene if an image fails to download
  */
-function generateFallbackCard(destPath: string, width: number, height: number, colorHex = '0x0f172a') {
-  execSync(
-    `ffmpeg -y -f lavfi -i "color=c=${colorHex}:s=${width}x${height}:d=1" -vframes 1 "${destPath}"`,
-    { stdio: 'pipe' }
-  );
+async function generateFallbackCard(destPath: string, width: number, height: number, colorHex = '0x0f172a') {
+  await runFfmpegAsync([
+    '-y',
+    '-f',
+    'lavfi',
+    '-i',
+    `color=c=${colorHex}:s=${width}x${height}:d=1`,
+    '-vframes',
+    '1',
+    destPath,
+  ]);
 }
 
 export interface RenderResult {
-  videoBuffer: Buffer;
   videoFilePath: string;
+  videoSizeBytes: number;
+  videoBuffer?: Buffer;
   title: string;
   filename: string;
 }
@@ -209,16 +293,17 @@ export interface RenderResult {
 /**
  * 100% Autonomous Server-Side Video Production Engine:
  * - Extracts story/reportage
- * - Synthesizes neural voice with MsEdgeTTS
+ * - Synthesizes neural voice with MsEdgeTTS (sanitized SSML)
  * - Gathers scene images/videos
- * - Uses FFmpeg to render pristine MP4 video matching aspect ratio (9:16, 16:9, 1:1)
- * - Runs completely in Node.js background without requiring browser to stay open
+ * - Uses FFmpeg asynchronously with `-preset veryfast -tune stillimage -threads 2`
+ * - Non-blocking event loop, bounded RAM and zero unhandled rejections
  */
 export async function renderVideoForJob(
   job: WhatsAppVideoJob,
   onProgress?: (progress: number, statusText: string) => void
 ): Promise<RenderResult> {
   const jobId = job.id;
+  const jobStartTime = Date.now();
   const jobDir = path.join(TEMP_BASE_DIR, jobId);
   if (!fs.existsSync(jobDir)) {
     fs.mkdirSync(jobDir, { recursive: true });
@@ -230,8 +315,10 @@ export async function renderVideoForJob(
 
   try {
     notify(10, 'Iniciando produção autônoma do vídeo no servidor...');
+    console.log(`[Renderer] [Job ${jobId}] Iniciando renderização para comando: ${job.parsed.commandUsed}`);
 
     // 1. Script Generation & Scene Breakdown
+    const scriptStartTime = Date.now();
     let title = 'Vídeo IA Narrada';
     let fullNarration = '';
     interface SceneItem {
@@ -338,8 +425,10 @@ export async function renderVideoForJob(
         },
       ];
     }
+    console.log(`[Renderer] [Job ${jobId}] [Perf] Roteiro estruturado em ${Date.now() - scriptStartTime}ms (${scenes.length} cenas)`);
 
     // 2. Synthesize TTS Audio
+    const ttsStartTime = Date.now();
     notify(35, `Sintetizando locução neural com voz ${job.parsed.voiceName || 'Francisca'}...`);
     const tempAudioPath = path.join(jobDir, 'narration.mp3');
     const totalDurationSec = await synthesizeFullAudioToFile(
@@ -347,6 +436,7 @@ export async function renderVideoForJob(
       job.parsed.voiceId || 'pt-BR-FranciscaNeural',
       tempAudioPath
     );
+    console.log(`[Renderer] [Job ${jobId}] [Perf] TTS concluído em ${Date.now() - ttsStartTime}ms (Duração do áudio: ${totalDurationSec.toFixed(1)}s)`);
 
     // 3. Resolve Media for each scene
     notify(52, 'Obtendo imagens e vídeos para as cenas...');
@@ -362,6 +452,7 @@ export async function renderVideoForJob(
     const colors = ['0x0f172a', '0x1e1b4b', '0x172554', '0x134e4a', '0x312e81', '0x18181b'];
 
     for (let idx = 0; idx < scenes.length; idx++) {
+      const sceneStartTime = Date.now();
       const sc = scenes[idx];
       notify(55 + Math.round((idx / scenes.length) * 20), `Preparando mídia da cena ${idx + 1}/${scenes.length}...`);
 
@@ -386,7 +477,7 @@ export async function renderVideoForJob(
         mediaReady = await downloadMediaToLocalFile(sc.mediaUrl, sceneImgPath);
       }
 
-      // If still not ready, search web media (Wikimedia/Wikipedia)
+      // If still not ready, search web media (Wikimedia/Wikipedia direct URLs)
       if (!mediaReady) {
         try {
           const searchTerms = [sc.searchTag, sc.caption, title].filter(Boolean) as string[];
@@ -403,14 +494,14 @@ export async function renderVideoForJob(
       // Fallback if no image could be downloaded: render a pristine gradient color slide
       if (!mediaReady && !isVideoClip) {
         const col = colors[idx % colors.length];
-        generateFallbackCard(sceneImgPath, targetWidth, targetHeight, col);
+        await generateFallbackCard(sceneImgPath, targetWidth, targetHeight, col);
         mediaReady = true;
       }
 
       // Build individual scene video clip with FFmpeg
       const sceneClipPath = path.join(jobDir, `clip_${idx}.mp4`);
 
-      // Subtitle filter
+      // Subtitle filter (sanitized against quotes, newlines and emojis)
       let subtitleFilter = '';
       if (job.parsed.showSubtitles) {
         const textForSub = escapeDrawText(sc.caption || sc.narrationSegment || '');
@@ -424,34 +515,73 @@ export async function renderVideoForJob(
       if (isVideoClip) {
         const rawVid = path.join(jobDir, `scene_${idx}_video.mp4`);
         const vidFilter = `scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2:black,setsar=1${subtitleFilter}`;
-        execSync(
-          `ffmpeg -y -i "${rawVid}" -t ${sceneDuration.toFixed(2)} -vf "${vidFilter}" -c:v libx264 -pix_fmt yuv420p -r 25 -an "${sceneClipPath}"`,
-          { stdio: 'pipe' }
-        );
+        await runFfmpegAsync([
+          '-y',
+          '-i',
+          rawVid,
+          '-t',
+          sceneDuration.toFixed(2),
+          '-vf',
+          vidFilter,
+          '-c:v',
+          'libx264',
+          '-preset',
+          'veryfast',
+          '-threads',
+          '2',
+          '-pix_fmt',
+          'yuv420p',
+          '-r',
+          '25',
+          '-an',
+          sceneClipPath,
+        ]);
       } else {
-        // Image scene clip with scale & pad
+        // Image scene clip with scale & pad, using veryfast + stillimage for 5x speedup and bounded RAM
         const imgFilter = `scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2:black,setsar=1${subtitleFilter}`;
-        execSync(
-          `ffmpeg -y -loop 1 -i "${sceneImgPath}" -t ${sceneDuration.toFixed(2)} -vf "${imgFilter}" -c:v libx264 -pix_fmt yuv420p -r 25 "${sceneClipPath}"`,
-          { stdio: 'pipe' }
-        );
+        await runFfmpegAsync([
+          '-y',
+          '-loop',
+          '1',
+          '-i',
+          sceneImgPath,
+          '-t',
+          sceneDuration.toFixed(2),
+          '-vf',
+          imgFilter,
+          '-c:v',
+          'libx264',
+          '-preset',
+          'veryfast',
+          '-tune',
+          'stillimage',
+          '-threads',
+          '2',
+          '-pix_fmt',
+          'yuv420p',
+          '-r',
+          '25',
+          sceneClipPath,
+        ]);
       }
 
       sceneClipPaths.push(sceneClipPath);
+      console.log(`[Renderer] [Job ${jobId}] [Perf] Cena ${idx + 1}/${scenes.length} renderizada em ${Date.now() - sceneStartTime}ms`);
     }
 
     // 4. Concatenate all scene clips
+    const concatStartTime = Date.now();
     notify(80, 'Renderizando e unificando trilha de vídeo MP4...');
     const concatListPath = path.join(jobDir, 'concat_list.txt');
     const concatContent = sceneClipPaths.map((p) => `file '${p}'`).join('\n');
     fs.writeFileSync(concatListPath, concatContent);
 
     const videoOnlyPath = path.join(jobDir, 'all_scenes.mp4');
-    execSync(`ffmpeg -y -f concat -safe 0 -i "${concatListPath}" -c copy "${videoOnlyPath}"`, {
-      stdio: 'pipe',
-    });
+    await runFfmpegAsync(['-y', '-f', 'concat', '-safe', '0', '-i', concatListPath, '-c', 'copy', videoOnlyPath]);
+    console.log(`[Renderer] [Job ${jobId}] [Perf] Concatenação de cenas concluída em ${Date.now() - concatStartTime}ms`);
 
     // 5. Final Mux: Video + Speech Audio (+ Background Music if enabled)
+    const muxStartTime = Date.now();
     notify(88, 'Mixando locução neural e masterizando áudio...');
     const finalOutputPath = path.join(VIDEOS_DIR, `${jobId}.mp4`);
 
@@ -459,33 +589,84 @@ export async function renderVideoForJob(
       // Generate subtle atmospheric background bed (lavfi harmonic audio) and mix with speech
       const bgAudioPath = path.join(jobDir, 'bg_bed.mp3');
       try {
-        execSync(
-          `ffmpeg -y -f lavfi -i "sine=frequency=130:duration=${Math.ceil(totalDurationSec + 2)}" -af "volume=0.06,lowpass=f=400" -c:a mp3 "${bgAudioPath}"`,
-          { stdio: 'pipe' }
-        );
-        execSync(
-          `ffmpeg -y -i "${videoOnlyPath}" -i "${tempAudioPath}" -i "${bgAudioPath}" -filter_complex "[1:a]volume=1.0[v1]; [2:a]volume=0.08[v2]; [v1][v2]amix=inputs=2:duration=first[aout]" -map 0:v -map "[aout]" -c:v copy -c:a aac -b:a 192k -shortest "${finalOutputPath}"`,
-          { stdio: 'pipe' }
-        );
-      } catch {
-        // Fallback to pure speech muxing if complex filter fails
-        execSync(
-          `ffmpeg -y -i "${videoOnlyPath}" -i "${tempAudioPath}" -c:v copy -c:a aac -b:a 192k -shortest "${finalOutputPath}"`,
-          { stdio: 'pipe' }
-        );
+        await runFfmpegAsync([
+          '-y',
+          '-f',
+          'lavfi',
+          '-i',
+          `sine=frequency=130:duration=${Math.ceil(totalDurationSec + 2)}`,
+          '-af',
+          'volume=0.06,lowpass=f=400',
+          '-c:a',
+          'mp3',
+          bgAudioPath,
+        ]);
+        await runFfmpegAsync([
+          '-y',
+          '-i',
+          videoOnlyPath,
+          '-i',
+          tempAudioPath,
+          '-i',
+          bgAudioPath,
+          '-filter_complex',
+          '[1:a]volume=1.0[v1]; [2:a]volume=0.08[v2]; [v1][v2]amix=inputs=2:duration=first[aout]',
+          '-map',
+          '0:v',
+          '-map',
+          '[aout]',
+          '-c:v',
+          'copy',
+          '-c:a',
+          'aac',
+          '-b:a',
+          '192k',
+          '-shortest',
+          finalOutputPath,
+        ]);
+      } catch (muxBgErr) {
+        console.warn('[Renderer] Fallback para mixagem direta sem trilha de fundo:', muxBgErr);
+        await runFfmpegAsync([
+          '-y',
+          '-i',
+          videoOnlyPath,
+          '-i',
+          tempAudioPath,
+          '-c:v',
+          'copy',
+          '-c:a',
+          'aac',
+          '-b:a',
+          '192k',
+          '-shortest',
+          finalOutputPath,
+        ]);
       }
     } else {
-      execSync(
-        `ffmpeg -y -i "${videoOnlyPath}" -i "${tempAudioPath}" -c:v copy -c:a aac -b:a 192k -shortest "${finalOutputPath}"`,
-        { stdio: 'pipe' }
-      );
+      await runFfmpegAsync([
+        '-y',
+        '-i',
+        videoOnlyPath,
+        '-i',
+        tempAudioPath,
+        '-c:v',
+        'copy',
+        '-c:a',
+        'aac',
+        '-b:a',
+        '192k',
+        '-shortest',
+        finalOutputPath,
+      ]);
     }
+    console.log(`[Renderer] [Job ${jobId}] [Perf] Mixagem final de áudio concluída em ${Date.now() - muxStartTime}ms`);
 
     if (!fs.existsSync(finalOutputPath)) {
       throw new Error('Falha ao compor o arquivo MP4 final.');
     }
 
-    const videoBuffer = fs.readFileSync(finalOutputPath);
+    const stat = fs.statSync(finalOutputPath);
+    const videoSizeBytes = stat.size;
     const safeTitle = title.slice(0, 45).replace(/[^a-zA-Z0-9_\-\s]/g, '');
     const filename = `${safeTitle.replace(/\s+/g, '_')}.mp4`;
 
@@ -494,16 +675,22 @@ export async function renderVideoForJob(
       fs.rmSync(jobDir, { recursive: true, force: true });
     } catch {}
 
+    const totalElapsedSec = ((Date.now() - jobStartTime) / 1000).toFixed(2);
+    const sizeMb = (videoSizeBytes / (1024 * 1024)).toFixed(2);
+    console.log(
+      `[Renderer] [Job ${jobId}] [Perf] ✅ TEMPO TOTAL DE RENDERIZAÇÃO: ${totalElapsedSec}s | Tamanho: ${sizeMb} MB | Formato: ${job.parsed.aspectRatio || '9:16'}`
+    );
+
     notify(95, 'Vídeo MP4 renderizado com sucesso!');
 
     return {
-      videoBuffer,
       videoFilePath: finalOutputPath,
+      videoSizeBytes,
       title,
       filename,
     };
   } catch (err: any) {
-    // Clean up temp dir on error
+    // Clean up temp dir on error to prevent disk accumulation
     try {
       if (fs.existsSync(jobDir)) fs.rmSync(jobDir, { recursive: true, force: true });
     } catch {}

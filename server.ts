@@ -8,6 +8,27 @@ import dotenv from 'dotenv';
 dotenv.config();
 dotenv.config({ path: '.env.local' });
 
+// Global process error handlers: prevents transient WebSocket/stream drops from crashing Node,
+// while properly logging full diagnostic context and allowing controlled exit on fatal system faults.
+process.on('unhandledRejection', (reason: any) => {
+  const errMsg = reason?.message || String(reason);
+  console.error('[Process Protection] ⚠️ Rejeição de Promise não tratada detectada:', errMsg);
+  if (reason?.stack) {
+    console.error('[Process Protection] Stack:', reason.stack);
+  }
+});
+
+process.on('uncaughtException', (err: Error) => {
+  console.error('[Process Protection] 🚨 Exceção não capturada crítica:', err?.message || err);
+  if (err?.stack) {
+    console.error('[Process Protection] Stack:', err.stack);
+  }
+  if (err?.message?.includes('out of memory') || err?.message?.includes('ENOMEM')) {
+    console.error('[Process Protection] Falha irrecuperável de memória do sistema. Encerrando para reinício limpo...');
+    process.exit(1);
+  }
+});
+
 import { MsEdgeTTS, OUTPUT_FORMAT } from 'msedge-tts';
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import * as cheerio from 'cheerio';

@@ -1754,12 +1754,13 @@ class WhatsAppAutomationService {
         });
       });
 
-      console.log(`[WhatsAppBot] Vídeo gerado no servidor com sucesso (${renderResult.videoBuffer.length} bytes)! Enviando para o WhatsApp...`);
+      console.log(`[WhatsAppBot] Vídeo gerado no servidor com sucesso (${renderResult.videoSizeBytes} bytes)! Enviando para o WhatsApp...`);
 
-      await this.completeJobAndSendVideo(job.id, renderResult.videoBuffer, {
+      await this.completeJobAndSendVideo(job.id, renderResult.videoFilePath, {
         title: renderResult.title,
         filename: renderResult.filename,
         appBaseUrl: process.env.APP_URL,
+        videoSizeBytes: renderResult.videoSizeBytes,
       });
 
       console.log(`[WhatsAppBot] Job ${job.id} finalizado e entregue com sucesso!`);
@@ -1848,8 +1849,8 @@ class WhatsAppAutomationService {
 
   public async completeJobAndSendVideo(
     jobId: string,
-    videoBuffer: Buffer,
-    metadata: { title?: string; caption?: string; filename?: string; appBaseUrl?: string }
+    videoSource: Buffer | string,
+    metadata: { title?: string; caption?: string; filename?: string; appBaseUrl?: string; videoSizeBytes?: number }
   ): Promise<WhatsAppVideoJob | null> {
     const idx = this.jobs.findIndex((j) => j.id === jobId);
     if (idx === -1) return null;
@@ -1857,7 +1858,19 @@ class WhatsAppAutomationService {
     const job = this.jobs[idx];
     const safeFilename = `${jobId}.mp4`;
     const filePath = path.join(VIDEOS_DIR, safeFilename);
-    fs.writeFileSync(filePath, videoBuffer);
+
+    let fileSize = metadata.videoSizeBytes || 0;
+    if (typeof videoSource === 'string') {
+      if (videoSource !== filePath && fs.existsSync(videoSource)) {
+        fs.copyFileSync(videoSource, filePath);
+      }
+      if (!fileSize && fs.existsSync(filePath)) {
+        fileSize = fs.statSync(filePath).size;
+      }
+    } else if (Buffer.isBuffer(videoSource)) {
+      fs.writeFileSync(filePath, videoSource);
+      fileSize = videoSource.length;
+    }
 
     const videoTitle = metadata.title || job.title || 'Vídeo IA Narrada';
     job.title = videoTitle;
@@ -1869,11 +1882,12 @@ class WhatsAppAutomationService {
     job.updatedAt = Date.now();
     this.persistJobs();
 
-    const sizeMb = (videoBuffer.length / (1024 * 1024)).toFixed(1);
-    const isLargeFile = videoBuffer.length > 40 * 1024 * 1024; // > 40MB send as Document
+    const sizeMb = (fileSize / (1024 * 1024)).toFixed(1);
+    const isLargeFile = fileSize > 40 * 1024 * 1024; // > 40MB send as Document
 
     let sentOk = false;
     if (this.sock && this.connectionState === 'connected' && job.groupId && !job.groupId.startsWith('sim-')) {
+      const sendStart = Date.now();
       try {
         const quoted = this.rawMessagesMap.get(jobId);
         const formatLabel =
@@ -1900,30 +1914,65 @@ class WhatsAppAutomationService {
 
         const fileName = metadata.filename || `${videoTitle.replace(/[^a-zA-Z0-9_\-]/g, '_').slice(0, 36)}.mp4`;
 
+        // Stream directly from disk without holding 30MB+ buffer in memory
         if (isLargeFile) {
-          await this.sock.sendMessage(
-            job.groupId,
-            {
-              document: videoBuffer,
-              mimetype: 'video/mp4',
-              fileName,
-              caption: captionText,
-            },
-            quoted ? { quoted } : undefined
-          );
+          try {
+            await this.sock.sendMessage(
+              job.groupId,
+              {
+                document: { url: filePath },
+                mimetype: 'video/mp4',
+                fileName,
+                caption: captionText,
+              },
+              quoted ? { quoted } : undefined
+            );
+            sentOk = true;
+          } catch (streamErr) {
+            console.warn('[WhatsAppBot] Fallback para envio com buffer (document):', streamErr);
+            const buf = fs.readFileSync(filePath);
+            await this.sock.sendMessage(
+              job.groupId,
+              {
+                document: buf,
+                mimetype: 'video/mp4',
+                fileName,
+                caption: captionText,
+              },
+              quoted ? { quoted } : undefined
+            );
+            sentOk = true;
+          }
         } else {
-          await this.sock.sendMessage(
-            job.groupId,
-            {
-              video: videoBuffer,
-              mimetype: 'video/mp4',
-              fileName,
-              caption: captionText,
-            },
-            quoted ? { quoted } : undefined
-          );
+          try {
+            await this.sock.sendMessage(
+              job.groupId,
+              {
+                video: { url: filePath },
+                mimetype: 'video/mp4',
+                fileName,
+                caption: captionText,
+              },
+              quoted ? { quoted } : undefined
+            );
+            sentOk = true;
+          } catch (streamErr) {
+            console.warn('[WhatsAppBot] Fallback para envio com buffer (video):', streamErr);
+            const buf = fs.readFileSync(filePath);
+            await this.sock.sendMessage(
+              job.groupId,
+              {
+                video: buf,
+                mimetype: 'video/mp4',
+                fileName,
+                caption: captionText,
+              },
+              quoted ? { quoted } : undefined
+            );
+            sentOk = true;
+          }
         }
-        sentOk = true;
+        console.log(`[WhatsAppBot] [Perf] Envio para o WhatsApp concluído em ${Date.now() - sendStart}ms`);
       } catch (sendErr: any) {
         console.warn('Error sending video back to WhatsApp:', sendErr);
         job.error = `Vídeo gerado, mas houve falha no envio ao WhatsApp: ${sendErr?.message || 'Erro de rede'}`;
@@ -1957,9 +2006,9 @@ class WhatsAppAutomationService {
       throw new Error('Selecione um grupo válido do WhatsApp para enviar o vídeo.');
     }
 
-    const videoBuffer = fs.readFileSync(job.videoFilePath);
-    const sizeMb = (videoBuffer.length / (1024 * 1024)).toFixed(1);
-    const isLargeFile = videoBuffer.length > 40 * 1024 * 1024;
+    const fileSize = fs.statSync(job.videoFilePath).size;
+    const sizeMb = (fileSize / (1024 * 1024)).toFixed(1);
+    const isLargeFile = fileSize > 40 * 1024 * 1024;
     const formatLabel =
       job.parsed.aspectRatio === '9:16'
         ? '9:16 Vertical'
@@ -1976,19 +2025,39 @@ class WhatsAppAutomationService {
     const fileName = `${(job.title || 'video-ia-narrada').replace(/[^a-zA-Z0-9_\-]/g, '_').slice(0, 36)}.mp4`;
 
     if (isLargeFile) {
-      await this.sock.sendMessage(destinationJid, {
-        document: videoBuffer,
-        mimetype: 'video/mp4',
-        fileName,
-        caption: captionText,
-      });
+      try {
+        await this.sock.sendMessage(destinationJid, {
+          document: { url: job.videoFilePath },
+          mimetype: 'video/mp4',
+          fileName,
+          caption: captionText,
+        });
+      } catch {
+        const videoBuffer = fs.readFileSync(job.videoFilePath);
+        await this.sock.sendMessage(destinationJid, {
+          document: videoBuffer,
+          mimetype: 'video/mp4',
+          fileName,
+          caption: captionText,
+        });
+      }
     } else {
-      await this.sock.sendMessage(destinationJid, {
-        video: videoBuffer,
-        mimetype: 'video/mp4',
-        fileName,
-        caption: captionText,
-      });
+      try {
+        await this.sock.sendMessage(destinationJid, {
+          video: { url: job.videoFilePath },
+          mimetype: 'video/mp4',
+          fileName,
+          caption: captionText,
+        });
+      } catch {
+        const videoBuffer = fs.readFileSync(job.videoFilePath);
+        await this.sock.sendMessage(destinationJid, {
+          video: videoBuffer,
+          mimetype: 'video/mp4',
+          fileName,
+          caption: captionText,
+        });
+      }
     }
 
     job.sentToWhatsApp = true;
